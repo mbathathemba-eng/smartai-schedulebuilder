@@ -24,6 +24,7 @@ import {
   Moon,
   Clock,
   CheckCircle2,
+  Trash2,
 } from 'lucide-react';
 
 interface JeraldPanelProps {
@@ -33,6 +34,7 @@ interface JeraldPanelProps {
   isTyping: boolean;
   error: AiError | null;
   onSend: (text: string) => void;
+  onClearChat: () => void;
   energy: UserEnergyState;
 }
 
@@ -56,11 +58,13 @@ export default function JeraldPanel({
   isTyping,
   error,
   onSend,
+  onClearChat,
   energy,
 }: JeraldPanelProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const [showQuickActions, setShowQuickActions] = useState(true);
+  const [confirmClear, setConfirmClear] = useState(false);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -112,8 +116,44 @@ export default function JeraldPanel({
             </div>
           </div>
         </div>
-        <div className={`${energyBg} ${energyBorder} border rounded-lg px-2 py-1`}>
-          <span className={`text-[10px] font-medium ${energyText}`}>{ENERGY_CONTEXT[energy]}</span>
+        <div className="flex items-center gap-2">
+          <div className={`${energyBg} ${energyBorder} border rounded-lg px-2 py-1`}>
+            <span className={`text-[10px] font-medium ${energyText}`}>{ENERGY_CONTEXT[energy]}</span>
+          </div>
+          {confirmClear ? (
+            <div className="flex items-center gap-1 animate-fadeIn">
+              <button
+                onClick={() => {
+                  onClearChat();
+                  setShowQuickActions(true);
+                  setConfirmClear(false);
+                }}
+                className="p-2 rounded-lg text-red-500 hover:text-red-600 hover:bg-red-500/10 transition-colors touch-target"
+                aria-label="Confirm clear chat"
+                title="Confirm clear"
+              >
+                <CheckCircle2 className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => setConfirmClear(false)}
+                className="p-2 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-500/10 transition-colors touch-target"
+                aria-label="Cancel clear chat"
+                title="Cancel"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => setConfirmClear(true)}
+              disabled={messages.length === 0}
+              className="p-2 rounded-lg text-slate-400 hover:text-orange-500 hover:bg-orange-500/10 transition-colors touch-target disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-slate-400"
+              aria-label="Clear chat"
+              title="Clear chat"
+            >
+              <Trash2 className="w-4 h-4" />
+            </button>
+          )}
         </div>
       </div>
 

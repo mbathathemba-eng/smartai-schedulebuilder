@@ -271,7 +271,19 @@ export function useChatMessages() {
     return newMsg;
   }, []);
 
-  return { messages, loading, addMessage, refresh: fetchMessages };
+  const clearMessages = useCallback(async () => {
+    const previousMessages = messages;
+    setMessages([]);
+
+    const { error } = await supabase.from('chat_messages').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+
+    if (error) {
+      setMessages(previousMessages);
+      throw error;
+    }
+  }, [messages]);
+
+  return { messages, loading, addMessage, clearMessages, refresh: fetchMessages };
 }
 
 // ------------------------------------------------------------------

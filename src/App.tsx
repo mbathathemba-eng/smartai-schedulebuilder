@@ -13,6 +13,7 @@
  */
 
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
 import { Task, ChatMessage, ViewTab, UserEnergyState } from './types';
 import { todayStr, tomorrowStr, parseSmartInput, formatLocalDate } from './lib/utils';
 import { useTasks, useChatMessages, useUserSettings } from './hooks/useSupabase';
@@ -433,7 +434,7 @@ function ViewHeader({
 
 export default function App() {
   const { tasks, loading: tasksLoading, addTask, updateTask, deleteTask } = useTasks();
-  const { messages, addMessage } = useChatMessages();
+  const { messages, addMessage, clearMessages } = useChatMessages();
   const { settings, loading: settingsLoading, updateSettings } = useUserSettings();
 
   const [activeTab, setActiveTab] = useState<ViewTab>('today');
@@ -697,6 +698,7 @@ export default function App() {
             isTyping={isTyping}
             error={chatError}
             onSend={sendChatMessage}
+            onClearChat={clearMessages}
             energy={energy}
           />
         );
@@ -741,7 +743,20 @@ export default function App() {
               <ThemeToggle theme={theme} onToggle={handleThemeToggle} />
             </div>
           </header>
-          <main className="flex-1 overflow-y-auto w-full">{renderView()}</main>
+          <main className="flex-1 overflow-y-auto w-full">
+            <AnimatePresence mode="wait">
+              <motion.div
+                key={activeTab}
+                initial={{ opacity: 0, x: -10 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 10 }}
+                transition={{ duration: 0.15, ease: 'easeOut' }}
+                className="h-full w-full"
+              >
+                {renderView()}
+              </motion.div>
+            </AnimatePresence>
+          </main>
         </div>
       </div>
 
@@ -763,7 +778,20 @@ export default function App() {
             <ThemeToggle theme={theme} onToggle={handleThemeToggle} />
           </div>
         </header>
-        <main className="flex-1 overflow-y-auto pb-20 w-full">{renderView()}</main>
+        <main className="flex-1 overflow-y-auto pb-20 w-full">
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={activeTab}
+              initial={{ opacity: 0, x: -10 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: 10 }}
+              transition={{ duration: 0.15, ease: 'easeOut' }}
+              className="h-full w-full"
+            >
+              {renderView()}
+            </motion.div>
+          </AnimatePresence>
+        </main>
         <TabNavigation activeTab={activeTab} onChangeTab={setActiveTab} variant="mobile" />
       </div>
 

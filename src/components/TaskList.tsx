@@ -210,11 +210,11 @@ export default function TaskList({
     if (task.completed) {
       onUpdateTask({ ...task, completed: false });
     } else {
+      // Fire optimistic update immediately so progress ring increments instantly.
+      // The CSS transition on the task card handles the visual fade.
       setCompletingTaskId(task.id);
-      setTimeout(() => {
-        onUpdateTask({ ...task, completed: true });
-        setCompletingTaskId(null);
-      }, 400);
+      onUpdateTask({ ...task, completed: true });
+      setTimeout(() => setCompletingTaskId(null), 400);
     }
   }, [onUpdateTask]);
 
@@ -388,9 +388,14 @@ export default function TaskList({
                 ) : (
                   <button
                     onClick={() => handleEditTitle(task)}
+                    onDoubleClick={(e) => {
+                      e.stopPropagation();
+                      handleEditTitle(task);
+                    }}
                     className={`text-sm text-left w-full transition-all ${
                       task.completed ? 'line-through text-slate-400' : 'text-slate-800 dark:text-slate-100 hover:text-orange-600 dark:hover:text-orange-400'
                     }`}
+                    title="Click or double-click to edit"
                   >
                     {task.title}
                   </button>
