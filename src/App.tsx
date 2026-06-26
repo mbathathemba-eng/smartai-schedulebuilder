@@ -561,7 +561,7 @@ export default function App() {
           energyLevel: t.energyLevel,
           startTime: t.startTime,
           completed: false,
-          date: activeDate,
+          date: t.date || activeDate,
           projectId: t.projectId,
         });
       }

@@ -14,7 +14,7 @@
 
 import { GoogleGenAI } from '@google/genai';
 import { Task, EnergyLevel, Priority, UserEnergyState } from '../types';
-import { generateId, todayStr, parseTimeStr } from '../lib/utils';
+import { generateId, todayStr, parseTimeStr, formatLocalDate } from '../lib/utils';
 
 // ------------------------------------------------------------------
 // ENVIRONMENT CONFIGURATION
@@ -627,19 +627,21 @@ function sanitizeTaskTitle(title: string): string {
 
 /**
  * Converts structured output to a Task object.
+ * Computes the target date from dateOffset using local calendar boundaries
+ * (never UTC) so "tomorrow" lands on the correct calendar day.
  */
 function structuredOutputToTask(structured: GeminiStructuredOutput): Task {
-  // Compute proper date from offset
+  // Compute proper date from offset using local calendar boundaries
   let taskDate: string;
 
   if (structured.dateOffset === null || structured.dateOffset === 0) {
     // dateOffset null or 0 = today
     taskDate = todayStr();
   } else {
-    // dateOffset 1+ = days from today
+    // dateOffset 1+ = days from today; use local midnight to avoid TZ drift
     const d = new Date();
     d.setDate(d.getDate() + structured.dateOffset);
-    taskDate = d.toLocaleDateString('en-CA'); // YYYY-MM-DD
+    taskDate = formatLocalDate(d);
   }
 
   // Parse time if present
