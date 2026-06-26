@@ -553,6 +553,8 @@ export default function App() {
       tasks: result.data.tasks,
     };
     await addMessage(assistantMsg);
+    // Pure state injection: map agent tasks directly into global state with zero alteration.
+    // Gemini has already computed the date, sanitized the title, and set the time.
     if (result.data.tasks.length > 0) {
       for (const t of result.data.tasks) {
         await addTask({
@@ -562,7 +564,7 @@ export default function App() {
           energyLevel: t.energyLevel,
           startTime: t.startTime,
           completed: false,
-          date: t.date || activeDate,
+          date: t.date,
           projectId: t.projectId,
         });
       }

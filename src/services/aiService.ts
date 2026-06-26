@@ -14,7 +14,7 @@
 
 import { GoogleGenAI } from '@google/genai';
 import { Task, EnergyLevel, Priority, UserEnergyState } from '../types';
-import { generateId, todayStr, parseTimeStr, formatLocalDate } from '../lib/utils';
+import { generateId, todayStr, parseTimeStr } from '../lib/utils';
 
 // ------------------------------------------------------------------
 // ENVIRONMENT CONFIGURATION
@@ -55,7 +55,27 @@ function getGeminiClient(): GoogleGenAI | null {
 // TYPES
 // ------------------------------------------------------------------
 
-/** Structured JSON output schema for Gemini AI */
+/**
+ * Pure operational payload returned by Gemini 2.5 Flash.
+ * Gemini acts as the backend agent — it computes dates, sanitizes titles,
+ * and returns ready-to-inject task objects. The frontend does ZERO assembly.
+ */
+export interface GeminiAgentTask {
+  id: string;
+  title: string;
+  date: string; // Explicit YYYY-MM-DD computed by the model
+  time: string | null; // HH:MM or null
+  duration: string; // e.g. "30m", "1h"
+  energy: 'low' | 'medium' | 'high';
+}
+
+export interface GeminiAgentPayload {
+  newTasks: GeminiAgentTask[];
+  globalEnergyUpdate: 'low' | 'medium' | 'high' | null;
+  coachingMessage: string;
+}
+
+/** Structured JSON output schema for Gemini AI (legacy compat for local sim) */
 export interface GeminiStructuredOutput {
   taskTitle: string | null;
   time: string | null; // HH:MM format
@@ -74,6 +94,8 @@ export interface AiResponse {
   energyStateChange?: UserEnergyState;
   /** Structured extraction result from Gemini */
   structured?: GeminiStructuredOutput;
+  /** Pure agent payload from Gemini (when using agent mode) */
+  agentPayload?: GeminiAgentPayload;
 }
 
 /** Standardized error shape returned when a network call fails. */
@@ -462,8 +484,10 @@ export async function processAiMessageAsync(userText: string, existingTasks: Tas
 
 /**
  * Calls Gemini 2.5 Flash using the official Google GenAI SDK.
- * This is the primary AI engine when VITE_GEMINI_API_KEY is configured.
- * Enforces strict structured JSON output schema.
+ * Gemini acts as the full backend system agent: it computes dates from the
+ * provided current system date, sanitizes task titles, and returns a clean
+ * operational payload (newTasks + globalEnergyUpdate + coachingMessage).
+ * The frontend maps newTasks directly into global state with zero alteration.
  */
 async function callGemini(userText: string, existingTasks: Task[], energy?: UserEnergyState): Promise<AiResult> {
   const client = getGeminiClient();
@@ -472,6 +496,8 @@ async function callGemini(userText: string, existingTasks: Task[], energy?: User
   }
 
   const systemPrompt = buildGeminiSystemPrompt(existingTasks, energy);
+  const currentDate = todayStr();
+  const stateContext = buildStateContext(existingTasks, energy, currentDate);
   const detectedEnergy = detectEnergyState(userText);
 
   try {
@@ -480,46 +506,44 @@ async function callGemini(userText: string, existingTasks: Task[], energy?: User
       contents: [
         {
           role: 'user',
-          parts: [{ text: userText }],
+          parts: [{ text: `${stateContext}\n\nUser prompt: ${userText}` }],
         },
       ],
       config: {
         systemInstruction: systemPrompt,
-        temperature: 0.3, // Lower temp for more consistent structured output
-        maxOutputTokens: 512,
+        temperature: 0.3,
+        maxOutputTokens: 1024,
         topP: 0.8,
+        responseMimeType: 'application/json',
       },
     });
 
     const rawReply = response.text || '';
 
-    // Parse structured JSON output from Gemini (pass original text for date inference)
-    const structured = parseStructuredOutput(rawReply, userText);
+    // Parse the pure agent payload returned by Gemini
+    const agentPayload = parseAgentPayload(rawReply);
 
-    // Extract tasks from structured output
-    const tasks: Task[] = [];
-    if (structured.taskTitle) {
-      tasks.push(structuredOutputToTask(structured));
-    }
+    // Map agent tasks directly into Task[] — zero frontend alteration.
+    // The model has already computed the explicit date string and sanitized titles.
+    const tasks: Task[] = agentPayload.newTasks.map(agentTaskToTask);
 
-    // Map detected energy to UserEnergyState
+    // Map global energy update to UserEnergyState
     let energyStateChange: UserEnergyState | undefined;
-    if (structured.detectedEnergy) {
-      energyStateChange = structured.detectedEnergy === 'low' ? 'Low' :
-                          structured.detectedEnergy === 'high' ? 'High' : 'Medium';
+    if (agentPayload.globalEnergyUpdate) {
+      energyStateChange = agentPayload.globalEnergyUpdate === 'low' ? 'Low' :
+                          agentPayload.globalEnergyUpdate === 'high' ? 'High' : 'Medium';
     }
 
     return {
       ok: true,
       data: {
-        reply: structured.coachingMessage,
+        reply: agentPayload.coachingMessage,
         tasks,
         energyStateChange: energyStateChange || detectedEnergy,
-        structured,
+        agentPayload,
       },
     };
   } catch (err) {
-    // Handle Gemini-specific errors
     if (err instanceof Error) {
       if (err.message.includes('API_KEY') || err.message.includes('401')) {
         return { ok: false, error: { code: 'UNAUTHORIZED', message: 'Invalid Gemini API key.' } };
@@ -536,172 +560,177 @@ async function callGemini(userText: string, existingTasks: Task[], energy?: User
 }
 
 /**
- * Parses structured JSON output from Gemini response.
- * Falls back to local simulation parsing if JSON is malformed.
- *
- * ALSO: Detects "tomorrow" / "today" keywords in raw text to infer dateOffset
- * if the model failed to set it correctly.
+ * Builds the state-aware runtime context appended to every user prompt.
+ * Gives Gemini global visibility into the current system date and full task list.
  */
-function parseStructuredOutput(rawReply: string, originalUserText: string): GeminiStructuredOutput {
-  // Try to extract JSON object from the response
-  const jsonMatch = rawReply.match(/\{[\s\S]*"taskTitle"[\s\S]*"coachingMessage"[\s\S]*\}/);
+function buildStateContext(existingTasks: Task[], energy: UserEnergyState | undefined, currentDate: string): string {
+  const taskSummary = existingTasks.length > 0
+    ? existingTasks.map((t) =>
+        `- id:${t.id} | title:"${t.title}" | date:${t.date} | time:${t.startTime !== undefined ? `${Math.floor(t.startTime / 60)}:${String(t.startTime % 60).padStart(2, '0')}` : 'none'} | duration:${t.duration}m | energy:${t.energyLevel} | priority:${t.priority} | completed:${t.completed}`
+      ).join('\n')
+    : 'No existing tasks.';
+
+  const energyLine = energy ? `User's current energy state: ${energy}` : 'User energy state: unknown';
+
+  return `=== SYSTEM RUNTIME CONTEXT ===
+Today's Date: ${currentDate}
+${energyLine}
+
+=== CURRENT TASK SCHEDULE (global state) ===
+${taskSummary}
+=== END CONTEXT ===`;
+}
+
+/**
+ * Parses the pure agent payload from Gemini's JSON response.
+ * Robust to markdown fences and extra whitespace.
+ */
+function parseAgentPayload(rawReply: string): GeminiAgentPayload {
+  const cleaned = rawReply
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim();
 
   let parsed: Record<string, unknown> | null = null;
-
-  if (jsonMatch) {
-    try {
-      parsed = JSON.parse(jsonMatch[0]);
-    } catch {
-      // JSON malformed, fall through
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    if (match) {
+      try {
+        parsed = JSON.parse(match[0]);
+      } catch {
+        parsed = null;
+      }
     }
   }
 
-  // Extract raw task title from parsed or null
-  let taskTitle: string | null = parsed && typeof parsed.taskTitle === 'string' ? parsed.taskTitle : null;
-  let dateOffset: number | null = parsed && typeof parsed.dateOffset === 'number' ? parsed.dateOffset : null;
-
-  // Detect "tomorrow" or "today" in user text to infer dateOffset
-  const lowerUserText = originalUserText.toLowerCase();
-  const hasTomorrow = /\btomorrow\b/i.test(lowerUserText);
-  const hasToday = /\btoday\b/i.test(lowerUserText);
-
-  // If model didn't set dateOffset but user text mentions dates, override
-  if (dateOffset === null) {
-    if (hasTomorrow) {
-      dateOffset = 1;
-    } else if (hasToday) {
-      dateOffset = 0;
-    }
+  if (!parsed || typeof parsed !== 'object') {
+    return { newTasks: [], globalEnergyUpdate: null, coachingMessage: rawReply.trim() || 'I could not process that.' };
   }
 
-  // If taskTitle is null but user text contains a task description, extract it
-  if (!taskTitle && parsed) {
-    // Try to extract from the raw reply's coachingMessage
-    const coachingMsg = typeof parsed.coachingMessage === 'string' ? parsed.coachingMessage : rawReply;
+  const rawTasks = Array.isArray(parsed.newTasks) ? parsed.newTasks : [];
+  const newTasks: GeminiAgentTask[] = rawTasks
+    .filter((t): t is Record<string, unknown> => typeof t === 'object' && t !== null)
+    .map(normalizeAgentTask)
+    .filter((t): t is GeminiAgentTask => t !== null);
 
-    // If coaching message mentions "tomorrow", the task date should be tomorrow
-    if (/\btomorrow\b/i.test(coachingMsg) && dateOffset === null) {
-      dateOffset = 1;
-    }
-  }
+  const rawEnergy = parsed.globalEnergyUpdate;
+  const globalEnergyUpdate: GeminiAgentPayload['globalEnergyUpdate'] =
+    rawEnergy === 'low' || rawEnergy === 'medium' || rawEnergy === 'high' ? rawEnergy : null;
 
-  // Sanitize task title: remove date/time phrases
-  if (taskTitle) {
-    taskTitle = sanitizeTaskTitle(taskTitle);
-  }
+  const coachingMessage = typeof parsed.coachingMessage === 'string'
+    ? parsed.coachingMessage
+    : 'Here is what I came up with.';
 
-  return {
-    taskTitle,
-    time: parsed && typeof parsed.time === 'string' ? parsed.time : null,
-    dateOffset,
-    detectedEnergy: parsed && ['low', 'medium', 'high'].includes(parsed.detectedEnergy as string)
-      ? (parsed.detectedEnergy as 'low' | 'medium' | 'high')
-      : null,
-    coachingMessage: parsed && typeof parsed.coachingMessage === 'string' ? parsed.coachingMessage : rawReply,
-  };
+  return { newTasks, globalEnergyUpdate, coachingMessage };
 }
 
 /**
- * Sanitizes task titles by removing:
- *   - "tomorrow", "today", "next week", etc.
- *   - Time references like "at 3pm", "at 14:00"
- *   - Date references like "on Monday", "on June 15"
+ * Normalizes a raw agent task object into a GeminiAgentTask.
+ * Falls back to today's date if the model omitted one.
  */
-function sanitizeTaskTitle(title: string): string {
-  return title
-    // Remove day references
-    .replace(/\b(tomorrow|today|tonight|yesterday)\b/gi, '')
-    .replace(/\b(next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|week|month))\b/gi, '')
-    .replace(/\b(on\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi, '')
-    // Remove time references
-    .replace(/\bat\s+\d{1,2}(:\d{2})?\s*(am|pm)?\b/gi, '')
-    .replace(/\b\d{1,2}(:\d{2})?\s*(am|pm)\b/gi, '')
-    // Remove date patterns
-    .replace(/\b(on\s+)?(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}\b/gi, '')
-    .replace(/\b\d{4}-\d{2}-\d{2}\b/g, '')
-    // Clean up
-    .replace(/\s+/g, ' ')
-    .replace(/^[-—,.\s]+|[-—,.\s]+$/g, '')
-    .trim();
+function normalizeAgentTask(raw: Record<string, unknown>): GeminiAgentTask | null {
+  const title = typeof raw.title === 'string' ? raw.title.trim() : '';
+  if (!title) return null;
+
+  const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : generateId();
+  const date = typeof raw.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.date) ? raw.date : todayStr();
+  const time = typeof raw.time === 'string' && /^\d{1,2}:\d{2}$/.test(raw.time) ? raw.time : null;
+  const duration = typeof raw.duration === 'string' ? raw.duration : '30m';
+  const rawEnergy = raw.energy;
+  const energy: GeminiAgentTask['energy'] =
+    rawEnergy === 'low' || rawEnergy === 'medium' || rawEnergy === 'high' ? rawEnergy : 'medium';
+
+  return { id, title, date, time, duration, energy };
 }
 
 /**
- * Converts structured output to a Task object.
- * Computes the target date from dateOffset using local calendar boundaries
- * (never UTC) so "tomorrow" lands on the correct calendar day.
+ * Converts a GeminiAgentTask (pure payload from the model) into a Task
+ * for the global state array. The frontend performs ZERO alteration —
+ * it trusts the model's computed date, sanitized title, and time.
  */
-function structuredOutputToTask(structured: GeminiStructuredOutput): Task {
-  // Compute proper date from offset using local calendar boundaries
-  let taskDate: string;
-
-  if (structured.dateOffset === null || structured.dateOffset === 0) {
-    // dateOffset null or 0 = today
-    taskDate = todayStr();
-  } else {
-    // dateOffset 1+ = days from today; use local midnight to avoid TZ drift
-    const d = new Date();
-    d.setDate(d.getDate() + structured.dateOffset);
-    taskDate = formatLocalDate(d);
-  }
-
-  // Parse time if present
+function agentTaskToTask(agent: GeminiAgentTask): Task {
   let startTime: number | undefined;
-  if (structured.time) {
-    const [h, m] = structured.time.split(':').map(Number);
+  if (agent.time) {
+    const [h, m] = agent.time.split(':').map(Number);
     if (!isNaN(h) && !isNaN(m)) {
       startTime = h * 60 + m;
     }
   }
 
-  // Sanitize title one more time to be sure
-  const cleanTitle = sanitizeTaskTitle(structured.taskTitle || 'Untitled Task');
+  const durationMinutes = parseDurationString(agent.duration);
 
   return {
-    id: generateId(),
-    title: cleanTitle,
-    duration: 30,
+    id: agent.id,
+    title: agent.title,
+    duration: durationMinutes,
     priority: 'Medium',
-    energyLevel: structured.detectedEnergy === 'low' ? 'Casual' :
-                 structured.detectedEnergy === 'high' ? 'High Energy' : 'Focus',
+    energyLevel: agent.energy === 'low' ? 'Casual' :
+                 agent.energy === 'high' ? 'High Energy' : 'Focus',
     startTime,
     completed: false,
     createdAt: Date.now(),
-    date: taskDate,
+    date: agent.date,
   };
+}
+
+/** Parses duration strings like "30m", "1h", "1.5h" into minutes. */
+function parseDurationString(duration: string): number {
+  const match = duration.match(/(\d+(?:\.\d+)?)\s*(h|m)/i);
+  if (!match) return 30;
+  const value = parseFloat(match[1]);
+  const unit = match[2].toLowerCase();
+  return unit === 'h' ? Math.round(value * 60) : Math.round(value);
 }
 
 /**
  * Builds the system prompt for Gemini with strict structured output requirements.
+ * Gemini is instructed to act as the operational backend agent — it computes
+ * dates mathematically from the provided current system date, sanitizes titles,
+ * and returns a clean operational payload.
  */
-function buildGeminiSystemPrompt(existingTasks: Task[], energy?: UserEnergyState): string {
-  const pending = existingTasks.filter((t) => !t.completed);
-  const taskList = pending.map((t) => `- ${t.title} (${t.energyLevel}, ${t.priority}${t.startTime ? `, ${Math.floor(t.startTime / 60)}:${String(t.startTime % 60).padStart(2, '0')}` : ''})`).join('\n') || 'No pending tasks.';
-  const energyContext = energy ? `The user's current energy level is: ${energy}.` : '';
+function buildGeminiSystemPrompt(_existingTasks: Task[], energy?: UserEnergyState): string {
+  const energyContext = energy ? `The user's current energy level is: ${energy}.` : 'User energy state is unknown.';
 
-  return `You are Jerald, an advanced adaptive schedule coach inside a task-scheduling app. Your job is to strip out conversational filler and extract exact parameter targets from user text.
+  return `You are the operational backend agent for this application. You do not just parse text; you manage calendar logic.
 
 ${energyContext}
 
-The user has the following pending tasks:
-${taskList}
+ABSOLUTE RULES:
+1. You are the operational backend agent for this application. You do not just parse text; you manage calendar logic.
+2. When a user specifies a relative day ("tomorrow", "next Monday", "today"), you must use the provided current system date (in the SYSTEM RUNTIME CONTEXT) to mathematically compute the exact target date string in YYYY-MM-DD format. Never return a relative offset — always return the fully computed absolute date.
+3. Sanitize all task titles. Never leave relative time markers like "Tomorrow" or "at 7 am" inside the task name string. Strip them out completely. The title must be a clean action phrase (e.g., "Go for a run", "Cook dinner", "Review lecture notes").
+4. You have full global state visibility — the SYSTEM RUNTIME CONTEXT block appended to every user prompt contains today's date and the complete current task schedule. Use it to avoid duplicate tasks and to inform scheduling decisions.
+5. If the user mentions their energy level ("I'm feeling low energy", "exhausted", "energized"), set globalEnergyUpdate accordingly. Otherwise return null.
+6. coachingMessage must be warm, concise, and actionable — Jerald's premium coaching voice.
 
-CRITICAL: You MUST respond with ONLY a valid JSON object in this EXACT schema - no other text:
+CRITICAL: You MUST respond with ONLY a valid JSON object in this EXACT schema — no markdown, no prose, no code fences:
 {
-  "taskTitle": "Concise, cleaned action string (e.g., 'Cook dinner') or null",
-  "time": "HH:MM formatted string or null",
-  "dateOffset": number (0 for today, 1 for tomorrow, 2+ for days out, or null for Inbox),
-  "detectedEnergy": "low" | "medium" | "high" | null,
-  "coachingMessage": "Jerald's smart coaching feedback context"
+  "newTasks": [
+    {
+      "id": "generate-unique-string",
+      "title": "Cleaned Action Title (e.g., 'Go for a run')",
+      "date": "Explicit calculated YYYY-MM-DD string (e.g., '2026-06-27')",
+      "time": "HH:MM or null",
+      "duration": "30m",
+      "energy": "low" | "medium" | "high"
+    }
+  ],
+  "globalEnergyUpdate": "low" | "medium" | "high" | null,
+  "coachingMessage": "Jerald's premium coaching response text."
 }
 
 Rules:
-1. Strip conversational filler like "yea", "I have low energy but", "can you help me" from task names
-2. Extract the core action only for taskTitle (e.g., "yea I have low energy but I want to cook dinner at 18:00" → taskTitle: "Cook dinner", time: "18:00")
-3. Detect energy mentions: "low energy", "drained", "exhausted" → low; "high energy", "energized" → high; "medium energy", "okay" → medium
-4. Parse dates: "today" → 0, "tomorrow" → 1, "next Monday" → calculate days from today
-5. coachingMessage should be warm, concise, and actionable
-6. Return null for taskTitle if no task is being added
-7. Respond with ONLY the JSON object, no markdown formatting`;
+- newTasks must be an empty array [] if the user is not adding tasks.
+- Each newTasks entry MUST include an explicit "date" string computed from the current system date. Never return "tomorrow" or a dateOffset — compute the actual YYYY-MM-DD.
+- Generate a unique id string for each task (e.g., "task_" + random alphanumeric).
+- "time" is HH:MM 24-hour format or null if unspecified.
+- "duration" is a string like "30m", "1h", "1.5h".
+- "energy" maps to task intensity: low = casual, medium = focus, high = high energy.
+- Strip ALL relative time markers ("tomorrow", "today", "at 7am", "on Monday") from the title string.
+- Respond with ONLY the JSON object.`;
 }
 
 /**
