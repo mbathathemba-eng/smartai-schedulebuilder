@@ -493,8 +493,8 @@ async function callGemini(userText: string, existingTasks: Task[], energy?: User
 
     const rawReply = response.text || '';
 
-    // Parse structured JSON output from Gemini
-    const structured = parseStructuredOutput(rawReply);
+    // Parse structured JSON output from Gemini (pass original text for date inference)
+    const structured = parseStructuredOutput(rawReply, userText);
 
     // Extract tasks from structured output
     const tasks: Task[] = [];
@@ -538,45 +538,105 @@ async function callGemini(userText: string, existingTasks: Task[], energy?: User
 /**
  * Parses structured JSON output from Gemini response.
  * Falls back to local simulation parsing if JSON is malformed.
+ *
+ * ALSO: Detects "tomorrow" / "today" keywords in raw text to infer dateOffset
+ * if the model failed to set it correctly.
  */
-function parseStructuredOutput(rawReply: string): GeminiStructuredOutput {
+function parseStructuredOutput(rawReply: string, originalUserText: string): GeminiStructuredOutput {
   // Try to extract JSON object from the response
   const jsonMatch = rawReply.match(/\{[\s\S]*"taskTitle"[\s\S]*"coachingMessage"[\s\S]*\}/);
 
+  let parsed: Record<string, unknown> | null = null;
+
   if (jsonMatch) {
     try {
-      const parsed = JSON.parse(jsonMatch[0]);
-      return {
-        taskTitle: typeof parsed.taskTitle === 'string' ? parsed.taskTitle : null,
-        time: typeof parsed.time === 'string' ? parsed.time : null,
-        dateOffset: typeof parsed.dateOffset === 'number' ? parsed.dateOffset : null,
-        detectedEnergy: ['low', 'medium', 'high'].includes(parsed.detectedEnergy) ? parsed.detectedEnergy : null,
-        coachingMessage: typeof parsed.coachingMessage === 'string' ? parsed.coachingMessage : rawReply,
-      };
+      parsed = JSON.parse(jsonMatch[0]);
     } catch {
       // JSON malformed, fall through
     }
   }
 
-  // Fallback: no valid JSON, return the raw reply as coaching message
+  // Extract raw task title from parsed or null
+  let taskTitle: string | null = parsed && typeof parsed.taskTitle === 'string' ? parsed.taskTitle : null;
+  let dateOffset: number | null = parsed && typeof parsed.dateOffset === 'number' ? parsed.dateOffset : null;
+
+  // Detect "tomorrow" or "today" in user text to infer dateOffset
+  const lowerUserText = originalUserText.toLowerCase();
+  const hasTomorrow = /\btomorrow\b/i.test(lowerUserText);
+  const hasToday = /\btoday\b/i.test(lowerUserText);
+
+  // If model didn't set dateOffset but user text mentions dates, override
+  if (dateOffset === null) {
+    if (hasTomorrow) {
+      dateOffset = 1;
+    } else if (hasToday) {
+      dateOffset = 0;
+    }
+  }
+
+  // If taskTitle is null but user text contains a task description, extract it
+  if (!taskTitle && parsed) {
+    // Try to extract from the raw reply's coachingMessage
+    const coachingMsg = typeof parsed.coachingMessage === 'string' ? parsed.coachingMessage : rawReply;
+
+    // If coaching message mentions "tomorrow", the task date should be tomorrow
+    if (/\btomorrow\b/i.test(coachingMsg) && dateOffset === null) {
+      dateOffset = 1;
+    }
+  }
+
+  // Sanitize task title: remove date/time phrases
+  if (taskTitle) {
+    taskTitle = sanitizeTaskTitle(taskTitle);
+  }
+
   return {
-    taskTitle: null,
-    time: null,
-    dateOffset: null,
-    detectedEnergy: null,
-    coachingMessage: rawReply,
+    taskTitle,
+    time: parsed && typeof parsed.time === 'string' ? parsed.time : null,
+    dateOffset,
+    detectedEnergy: parsed && ['low', 'medium', 'high'].includes(parsed.detectedEnergy as string)
+      ? (parsed.detectedEnergy as 'low' | 'medium' | 'high')
+      : null,
+    coachingMessage: parsed && typeof parsed.coachingMessage === 'string' ? parsed.coachingMessage : rawReply,
   };
+}
+
+/**
+ * Sanitizes task titles by removing:
+ *   - "tomorrow", "today", "next week", etc.
+ *   - Time references like "at 3pm", "at 14:00"
+ *   - Date references like "on Monday", "on June 15"
+ */
+function sanitizeTaskTitle(title: string): string {
+  return title
+    // Remove day references
+    .replace(/\b(tomorrow|today|tonight|yesterday)\b/gi, '')
+    .replace(/\b(next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|week|month))\b/gi, '')
+    .replace(/\b(on\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi, '')
+    // Remove time references
+    .replace(/\bat\s+\d{1,2}(:\d{2})?\s*(am|pm)?\b/gi, '')
+    .replace(/\b\d{1,2}(:\d{2})?\s*(am|pm)\b/gi, '')
+    // Remove date patterns
+    .replace(/\b(on\s+)?(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}\b/gi, '')
+    .replace(/\b\d{4}-\d{2}-\d{2}\b/g, '')
+    // Clean up
+    .replace(/\s+/g, ' ')
+    .replace(/^[-—,.\s]+|[-—,.\s]+$/g, '')
+    .trim();
 }
 
 /**
  * Converts structured output to a Task object.
  */
 function structuredOutputToTask(structured: GeminiStructuredOutput): Task {
-  const today = todayStr();
+  // Compute proper date from offset
+  let taskDate: string;
 
-  // Compute date from offset
-  let taskDate = today;
-  if (structured.dateOffset !== null && structured.dateOffset > 0) {
+  if (structured.dateOffset === null || structured.dateOffset === 0) {
+    // dateOffset null or 0 = today
+    taskDate = todayStr();
+  } else {
+    // dateOffset 1+ = days from today
     const d = new Date();
     d.setDate(d.getDate() + structured.dateOffset);
     taskDate = d.toLocaleDateString('en-CA'); // YYYY-MM-DD
@@ -586,12 +646,17 @@ function structuredOutputToTask(structured: GeminiStructuredOutput): Task {
   let startTime: number | undefined;
   if (structured.time) {
     const [h, m] = structured.time.split(':').map(Number);
-    startTime = h * 60 + m;
+    if (!isNaN(h) && !isNaN(m)) {
+      startTime = h * 60 + m;
+    }
   }
+
+  // Sanitize title one more time to be sure
+  const cleanTitle = sanitizeTaskTitle(structured.taskTitle || 'Untitled Task');
 
   return {
     id: generateId(),
-    title: structured.taskTitle || 'Untitled Task',
+    title: cleanTitle,
     duration: 30,
     priority: 'Medium',
     energyLevel: structured.detectedEnergy === 'low' ? 'Casual' :

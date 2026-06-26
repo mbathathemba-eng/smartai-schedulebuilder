@@ -79,9 +79,25 @@ function DurationSelector({
     setIsOpen(false);
   };
 
+  const [dropdownPosition, setDropdownPosition] = useState<{ top: number; left: number } | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (isOpen && triggerRef.current) {
+      const rect = triggerRef.current.getBoundingClientRect();
+      setDropdownPosition({
+        top: rect.bottom + 4,
+        left: rect.left,
+      });
+    } else {
+      setDropdownPosition(null);
+    }
+  }, [isOpen]);
+
   return (
     <div ref={dropdownRef} className="relative">
       <button
+        ref={triggerRef}
         onClick={(e) => {
           e.stopPropagation();
           setIsOpen(!isOpen);
@@ -93,8 +109,14 @@ function DurationSelector({
         <ChevronDown className={`w-2.5 h-2.5 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
       </button>
 
-      {isOpen && (
-        <div className="absolute top-full left-0 mt-1 z-50 glass-panel-strong rounded-xl p-1 min-w-[80px] shadow-xl animate-fadeIn">
+      {isOpen && dropdownPosition && (
+        <div
+          className="fixed z-[100] glass-panel-strong rounded-xl p-1 min-w-[80px] shadow-xl animate-fadeIn"
+          style={{
+            top: dropdownPosition.top,
+            left: dropdownPosition.left,
+          }}
+        >
           {DURATION_OPTIONS.map((opt) => (
             <button
               key={opt.value}
