@@ -15,7 +15,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { Task, ChatMessage, ViewTab, UserEnergyState } from './types';
-import { todayStr, tomorrowStr, parseSmartInput, formatLocalDate } from './lib/utils';
+import { todayStr, tomorrowStr, formatLocalDate } from './lib/utils';
 import { useTasks, useChatMessages, useUserSettings } from './hooks/useSupabase';
 import { processAiMessageAsync, AiError } from './services/aiService';
 
@@ -259,10 +259,11 @@ function MilestoneModal({ onClose, onDismiss }: { onClose: () => void; onDismiss
 // QUICK CAPTURE BUTTON
 // ------------------------------------------------------------------
 
-function QuickCaptureButton({ onAddTask, energy, activeDate }: { onAddTask: (task: Omit<Task, 'id' | 'createdAt'>) => void; energy: UserEnergyState; activeDate: string }) {
+function QuickCaptureButton({ onAddTask, energy, activeDate, existingTasks }: { onAddTask: (task: Omit<Task, 'id' | 'createdAt'>) => void; energy: UserEnergyState; activeDate: string; existingTasks: Task[] }) {
   const [isOpen, setIsOpen] = useState(false);
   const [input, setInput] = useState('');
   const [shake, setShake] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -271,25 +272,46 @@ function QuickCaptureButton({ onAddTask, energy, activeDate }: { onAddTask: (tas
     }
   }, [isOpen]);
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (!input.trim()) {
       setShake(true);
       setTimeout(() => setShake(false), 400);
       return;
     }
-    const parsed = parseSmartInput(input);
-    // If the user explicitly mentions a date (today/tomorrow/Monday etc), use that
-    // Otherwise, use the currently active/inspected calendar date
-    const targetDate = parsed.date || activeDate;
-    onAddTask({
-      title: parsed.title,
-      duration: 30,
-      priority: 'Medium',
-      energyLevel: energy === 'High' ? 'High Energy' : energy === 'Medium' ? 'Focus' : 'Casual',
-      startTime: parsed.time,
-      completed: false,
-      date: targetDate,
-    });
+
+    setIsProcessing(true);
+    // Route through the standard aiService pipeline so Gemini handles
+    // title sanitization, date computation, and time extraction — the
+    // same structured array logic as the main chat panel.
+    const result = await processAiMessageAsync(input.trim(), existingTasks, energy);
+    setIsProcessing(false);
+
+    if (result.ok && result.data.tasks.length > 0) {
+      // Loop through the returned array and push each fully-formed task
+      for (const t of result.data.tasks) {
+        onAddTask({
+          title: t.title,
+          duration: t.duration,
+          priority: t.priority,
+          energyLevel: t.energyLevel,
+          startTime: t.startTime,
+          completed: false,
+          date: t.date,
+          projectId: t.projectId,
+        });
+      }
+    } else if (result.ok && result.data.tasks.length === 0) {
+      // Fallback: if Gemini returned no tasks, use the raw input as a single task
+      onAddTask({
+        title: input.trim(),
+        duration: 30,
+        priority: 'Medium',
+        energyLevel: energy === 'High' ? 'High Energy' : energy === 'Medium' ? 'Focus' : 'Casual',
+        completed: false,
+        date: activeDate,
+      });
+    }
+
     setInput('');
     setIsOpen(false);
   };
@@ -313,21 +335,21 @@ function QuickCaptureButton({ onAddTask, energy, activeDate }: { onAddTask: (tas
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') handleSubmit();
+              if (e.key === 'Enter' && !isProcessing) handleSubmit();
               if (e.key === 'Escape') setIsOpen(false);
             }}
             placeholder="Try: Meeting at 2pm tomorrow"
             className="w-full bg-slate-100/50 dark:bg-slate-800/50 rounded-xl px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-orange-500/40 text-slate-800 dark:text-slate-100 placeholder-slate-400"
           />
           <p className="text-[10px] text-slate-400 mt-2">
-            Captures to Inbox. Use "today", "tomorrow", or dates.
+            {isProcessing ? 'Parsing with Gemini...' : 'AI-powered capture. Use "today", "tomorrow", or dates.'}
           </p>
           <button
             onClick={handleSubmit}
-            disabled={!input.trim()}
+            disabled={!input.trim() || isProcessing}
             className="w-full mt-3 px-4 py-3 rounded-xl text-sm font-medium bg-gradient-to-r from-orange-500 to-orange-600 text-white shadow-lg disabled:opacity-40 disabled:cursor-not-allowed hover:shadow-orange-500/30 transition-all touch-target"
           >
-            Capture
+            {isProcessing ? 'Capturing...' : 'Capture'}
           </button>
         </div>
       ) : (
@@ -798,7 +820,7 @@ export default function App() {
       </div>
 
       {/* Floating quick capture */}
-      <QuickCaptureButton onAddTask={handleAddTask} energy={energy} activeDate={activeDate} />
+      <QuickCaptureButton onAddTask={handleAddTask} energy={energy} activeDate={activeDate} existingTasks={tasks} />
 
       {/* Milestone modal with confetti */}
       {showMilestone && (

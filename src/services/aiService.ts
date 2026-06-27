@@ -70,7 +70,7 @@ export interface GeminiAgentTask {
 }
 
 export interface GeminiAgentPayload {
-  newTasks: GeminiAgentTask[];
+  tasks: GeminiAgentTask[];
   globalEnergyUpdate: 'low' | 'medium' | 'high' | null;
   coachingMessage: string;
 }
@@ -525,7 +525,7 @@ async function callGemini(userText: string, existingTasks: Task[], energy?: User
 
     // Map agent tasks directly into Task[] — zero frontend alteration.
     // The model has already computed the explicit date string and sanitized titles.
-    const tasks: Task[] = agentPayload.newTasks.map(agentTaskToTask);
+    const tasks: Task[] = agentPayload.tasks.map(agentTaskToTask);
 
     // Map global energy update to UserEnergyState
     let energyStateChange: UserEnergyState | undefined;
@@ -607,11 +607,12 @@ function parseAgentPayload(rawReply: string): GeminiAgentPayload {
   }
 
   if (!parsed || typeof parsed !== 'object') {
-    return { newTasks: [], globalEnergyUpdate: null, coachingMessage: rawReply.trim() || 'I could not process that.' };
+    return { tasks: [], globalEnergyUpdate: null, coachingMessage: rawReply.trim() || 'I could not process that.' };
   }
 
-  const rawTasks = Array.isArray(parsed.newTasks) ? parsed.newTasks : [];
-  const newTasks: GeminiAgentTask[] = rawTasks
+  // Accept both "tasks" (canonical) and "newTasks" (legacy) for robustness
+  const rawTasks = Array.isArray(parsed.tasks) ? parsed.tasks : (Array.isArray(parsed.newTasks) ? parsed.newTasks : []);
+  const agentTasks: GeminiAgentTask[] = rawTasks
     .filter((t): t is Record<string, unknown> => typeof t === 'object' && t !== null)
     .map(normalizeAgentTask)
     .filter((t): t is GeminiAgentTask => t !== null);
@@ -624,7 +625,7 @@ function parseAgentPayload(rawReply: string): GeminiAgentPayload {
     ? parsed.coachingMessage
     : 'Here is what I came up with.';
 
-  return { newTasks, globalEnergyUpdate, coachingMessage };
+  return { tasks: agentTasks, globalEnergyUpdate, coachingMessage };
 }
 
 /**
@@ -701,14 +702,15 @@ ${energyContext}
 ABSOLUTE RULES:
 1. You are the operational backend agent for this application. You do not just parse text; you manage calendar logic.
 2. When a user specifies a relative day ("tomorrow", "next Monday", "today"), you must use the provided current system date (in the SYSTEM RUNTIME CONTEXT) to mathematically compute the exact target date string in YYYY-MM-DD format. Never return a relative offset — always return the fully computed absolute date.
-3. Sanitize all task titles. Never leave relative time markers like "Tomorrow" or "at 7 am" inside the task name string. Strip them out completely. The title must be a clean action phrase (e.g., "Go for a run", "Cook dinner", "Review lecture notes").
-4. You have full global state visibility — the SYSTEM RUNTIME CONTEXT block appended to every user prompt contains today's date and the complete current task schedule. Use it to avoid duplicate tasks and to inform scheduling decisions.
-5. If the user mentions their energy level ("I'm feeling low energy", "exhausted", "energized"), set globalEnergyUpdate accordingly. Otherwise return null.
-6. coachingMessage must be warm, concise, and actionable — Jerald's premium coaching voice.
+3. You are the layout engine. You must extract clean, standalone event objects. Strip out words like "today", "tomorrow", "at 2pm", or "at 8:30am" from the task title, but ensure the remaining title is grammatically complete (e.g., "meeting at 2pm" becomes Title: "Meeting", Time: "14:00"). Do not leave dangling modifiers like "meeting at".
+4. Sanitize all task titles. Never leave relative time markers like "Tomorrow" or "at 7 am" inside the task name string. Strip them out completely. The title must be a clean, grammatically complete action phrase (e.g., "Go for a run", "Cook dinner", "Review lecture notes", "Meeting").
+5. You have full global state visibility — the SYSTEM RUNTIME CONTEXT block appended to every user prompt contains today's date and the complete current task schedule. Use it to avoid duplicate tasks and to inform scheduling decisions.
+6. If the user mentions their energy level ("I'm feeling low energy", "exhausted", "energized"), set globalEnergyUpdate accordingly. Otherwise return null.
+7. coachingMessage must be warm, concise, and actionable — Jerald's premium coaching voice.
 
 CRITICAL: You MUST respond with ONLY a valid JSON object in this EXACT schema — no markdown, no prose, no code fences:
 {
-  "newTasks": [
+  "tasks": [
     {
       "id": "generate-unique-string",
       "title": "Cleaned Action Title (e.g., 'Go for a run')",
@@ -723,13 +725,15 @@ CRITICAL: You MUST respond with ONLY a valid JSON object in this EXACT schema �
 }
 
 Rules:
-- newTasks must be an empty array [] if the user is not adding tasks.
-- Each newTasks entry MUST include an explicit "date" string computed from the current system date. Never return "tomorrow" or a dateOffset — compute the actual YYYY-MM-DD.
+- "tasks" MUST ALWAYS be an array, even if there is only 1 task. Never return a bare object — always wrap in an array.
+- "tasks" must be an empty array [] if the user is not adding tasks.
+- Each tasks entry MUST include an explicit "date" string computed from the current system date. Never return "tomorrow" or a dateOffset — compute the actual YYYY-MM-DD.
 - Generate a unique id string for each task (e.g., "task_" + random alphanumeric).
 - "time" is HH:MM 24-hour format or null if unspecified.
 - "duration" is a string like "30m", "1h", "1.5h".
 - "energy" maps to task intensity: low = casual, medium = focus, high = high energy.
-- Strip ALL relative time markers ("tomorrow", "today", "at 7am", "on Monday") from the title string.
+- Strip ALL relative time markers ("tomorrow", "today", "at 7am", "on Monday", "at 2pm", "at 8:30am") from the title string.
+- The title must be grammatically complete after stripping. If stripping leaves a dangling modifier (e.g., "meeting at"), capitalize and keep the noun ("Meeting").
 - Respond with ONLY the JSON object.`;
 }
 
