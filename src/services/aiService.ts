@@ -12,9 +12,9 @@
  *   - Standardized error handling with typed error codes for UI consumption
  */
 
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, Type } from '@google/genai';
 import { Task, EnergyLevel, Priority, UserEnergyState } from '../types';
-import { generateId, todayStr, parseTimeStr } from '../lib/utils';
+import { generateId, todayStr, parseTimeStr, formatLocalDate } from '../lib/utils';
 
 // ------------------------------------------------------------------
 // ENVIRONMENT CONFIGURATION
@@ -56,14 +56,61 @@ function getGeminiClient(): GoogleGenAI | null {
 // ------------------------------------------------------------------
 
 /**
+ * Strict schema for Gemini 2.5 Flash controlled mode.
+ * The SDK enforces this schema at the API level — the model CANNOT deviate.
+ */
+const TASK_RESPONSE_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    tasks: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          title: {
+            type: Type.STRING,
+            description: "The action name ONLY. Absolutely NO conversational introductory phrases, NO time/date words like 'tomorrow', 'today', 'at 8:30am', 'at 2pm'. Example: 'Meeting' not 'meeting at 2pm'."
+          },
+          time: {
+            type: Type.STRING,
+            description: "HH:MM format 24-hour time (e.g., '14:00') or empty string if unspecified.",
+            nullable: true
+          },
+          dateOffset: {
+            type: Type.INTEGER,
+            description: "0 for today, 1 for tomorrow, 2 for day after tomorrow, etc. REQUIRED - must be a non-negative integer."
+          },
+          energy: {
+            type: Type.STRING,
+            enum: ["low", "medium", "high"],
+            description: "Task energy intensity: low = casual task, medium = focus task, high = high-energy task."
+          }
+        },
+        required: ["title", "dateOffset", "energy"]
+      }
+    },
+    globalEnergy: {
+      type: Type.STRING,
+      enum: ["low", "medium", "high"],
+      nullable: true,
+      description: "User's overall energy state if mentioned, otherwise null."
+    },
+    coachingMessage: {
+      type: Type.STRING,
+      description: "Jerald's warm, concise, actionable coaching response."
+    }
+  },
+  required: ["tasks", "coachingMessage"]
+};
+
+/**
  * Pure operational payload returned by Gemini 2.5 Flash.
- * Gemini acts as the backend agent — it computes dates, sanitizes titles,
- * and returns ready-to-inject task objects. The frontend does ZERO assembly.
+ * Uses dateOffset (simple integer) which the parsing layer converts to YYYY-MM-DD.
  */
 export interface GeminiAgentTask {
   id: string;
   title: string;
-  date: string; // Explicit YYYY-MM-DD computed by the model
+  dateOffset: number; // 0 = today, 1 = tomorrow, etc.
   time: string | null; // HH:MM or null
   duration: string; // e.g. "30m", "1h"
   energy: 'low' | 'medium' | 'high';
@@ -515,6 +562,7 @@ async function callGemini(userText: string, existingTasks: Task[], energy?: User
         maxOutputTokens: 1024,
         topP: 0.8,
         responseMimeType: 'application/json',
+        responseSchema: TASK_RESPONSE_SCHEMA,
       },
     });
 
@@ -617,7 +665,8 @@ function parseAgentPayload(rawReply: string): GeminiAgentPayload {
     .map(normalizeAgentTask)
     .filter((t): t is GeminiAgentTask => t !== null);
 
-  const rawEnergy = parsed.globalEnergyUpdate;
+  // Accept both "globalEnergy" (schema field name) and "globalEnergyUpdate" (legacy)
+  const rawEnergy = parsed.globalEnergy ?? parsed.globalEnergyUpdate;
   const globalEnergyUpdate: GeminiAgentPayload['globalEnergyUpdate'] =
     rawEnergy === 'low' || rawEnergy === 'medium' || rawEnergy === 'high' ? rawEnergy : null;
 
@@ -630,27 +679,43 @@ function parseAgentPayload(rawReply: string): GeminiAgentPayload {
 
 /**
  * Normalizes a raw agent task object into a GeminiAgentTask.
- * Falls back to today's date if the model omitted one.
+ * Accepts both dateOffset (schema-enforced integer) and date (legacy YYYY-MM-DD string).
  */
 function normalizeAgentTask(raw: Record<string, unknown>): GeminiAgentTask | null {
   const title = typeof raw.title === 'string' ? raw.title.trim() : '';
   if (!title) return null;
 
   const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : generateId();
-  const date = typeof raw.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.date) ? raw.date : todayStr();
+
+  // Prefer dateOffset (schema-enforced), fallback to date (legacy), then today
+  let dateOffset: number;
+  if (typeof raw.dateOffset === 'number' && raw.dateOffset >= 0) {
+    dateOffset = Math.floor(raw.dateOffset);
+  } else if (typeof raw.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.date)) {
+    // Legacy: convert YYYY-MM-DD to dateOffset by computing days from today
+    const today = todayStr();
+    const targetDate = raw.date;
+    const todayDate = new Date(today + 'T00:00:00');
+    const targetDateObj = new Date(targetDate + 'T00:00:00');
+    const diffMs = targetDateObj.getTime() - todayDate.getTime();
+    dateOffset = Math.round(diffMs / (1000 * 60 * 60 * 24));
+    if (dateOffset < 0) dateOffset = 0;
+  } else {
+    dateOffset = 0; // Default to today
+  }
+
   const time = typeof raw.time === 'string' && /^\d{1,2}:\d{2}$/.test(raw.time) ? raw.time : null;
   const duration = typeof raw.duration === 'string' ? raw.duration : '30m';
   const rawEnergy = raw.energy;
   const energy: GeminiAgentTask['energy'] =
     rawEnergy === 'low' || rawEnergy === 'medium' || rawEnergy === 'high' ? rawEnergy : 'medium';
 
-  return { id, title, date, time, duration, energy };
+  return { id, title, dateOffset, time, duration, energy };
 }
 
 /**
  * Converts a GeminiAgentTask (pure payload from the model) into a Task
- * for the global state array. The frontend performs ZERO alteration —
- * it trusts the model's computed date, sanitized title, and time.
+ * for the global state array. Converts dateOffset to an explicit YYYY-MM-DD date string.
  */
 function agentTaskToTask(agent: GeminiAgentTask): Task {
   let startTime: number | undefined;
@@ -663,6 +728,9 @@ function agentTaskToTask(agent: GeminiAgentTask): Task {
 
   const durationMinutes = parseDurationString(agent.duration);
 
+  // Convert dateOffset to explicit YYYY-MM-DD date string
+  const taskDate = dateOffsetToString(agent.dateOffset);
+
   return {
     id: agent.id,
     title: agent.title,
@@ -673,8 +741,17 @@ function agentTaskToTask(agent: GeminiAgentTask): Task {
     startTime,
     completed: false,
     createdAt: Date.now(),
-    date: agent.date,
+    date: taskDate,
   };
+}
+
+/**
+ * Converts a dateOffset integer (0 = today, 1 = tomorrow, etc.) to a YYYY-MM-DD string.
+ */
+function dateOffsetToString(offset: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + offset);
+  return formatLocalDate(d);
 }
 
 /** Parses duration strings like "30m", "1h", "1.5h" into minutes. */
@@ -687,54 +764,44 @@ function parseDurationString(duration: string): number {
 }
 
 /**
- * Builds the system prompt for Gemini with strict structured output requirements.
- * Gemini is instructed to act as the operational backend agent — it computes
- * dates mathematically from the provided current system date, sanitizes titles,
- * and returns a clean operational payload.
+ * Builds the system prompt for Gemini. The schema is STRICTLY ENFORCED by the API
+ * via responseSchema, so this prompt focuses on semantic guidance.
  */
 function buildGeminiSystemPrompt(_existingTasks: Task[], energy?: UserEnergyState): string {
   const energyContext = energy ? `The user's current energy level is: ${energy}.` : 'User energy state is unknown.';
 
-  return `You are the operational backend agent for this application. You do not just parse text; you manage calendar logic.
+  return `You are the operational backend agent for this schedule management application. You parse user text and extract structured task data.
 
 ${energyContext}
 
-ABSOLUTE RULES:
-1. You are the operational backend agent for this application. You do not just parse text; you manage calendar logic.
-2. When a user specifies a relative day ("tomorrow", "next Monday", "today"), you must use the provided current system date (in the SYSTEM RUNTIME CONTEXT) to mathematically compute the exact target date string in YYYY-MM-DD format. Never return a relative offset — always return the fully computed absolute date.
-3. You are the layout engine. You must extract clean, standalone event objects. Strip out words like "today", "tomorrow", "at 2pm", or "at 8:30am" from the task title, but ensure the remaining title is grammatically complete (e.g., "meeting at 2pm" becomes Title: "Meeting", Time: "14:00"). Do not leave dangling modifiers like "meeting at".
-4. Sanitize all task titles. Never leave relative time markers like "Tomorrow" or "at 7 am" inside the task name string. Strip them out completely. The title must be a clean, grammatically complete action phrase (e.g., "Go for a run", "Cook dinner", "Review lecture notes", "Meeting").
-5. You have full global state visibility — the SYSTEM RUNTIME CONTEXT block appended to every user prompt contains today's date and the complete current task schedule. Use it to avoid duplicate tasks and to inform scheduling decisions.
-6. If the user mentions their energy level ("I'm feeling low energy", "exhausted", "energized"), set globalEnergyUpdate accordingly. Otherwise return null.
-7. coachingMessage must be warm, concise, and actionable — Jerald's premium coaching voice.
+TITLE SANITIZATION RULES (CRITICAL):
+- The "title" field must contain ONLY the action name, nothing else.
+- STRIP OUT all time words: "at 2pm", "at 8:30am", "at 3:00", etc.
+- STRIP OUT all date words: "today", "tomorrow", "on Monday", "next week", etc.
+- STRIP OUT all conversational filler: "I want to", "I need to", "please", "can you", etc.
+- After stripping, the title must be a complete, grammatically correct noun phrase.
 
-CRITICAL: You MUST respond with ONLY a valid JSON object in this EXACT schema — no markdown, no prose, no code fences:
-{
-  "tasks": [
-    {
-      "id": "generate-unique-string",
-      "title": "Cleaned Action Title (e.g., 'Go for a run')",
-      "date": "Explicit calculated YYYY-MM-DD string (e.g., '2026-06-27')",
-      "time": "HH:MM or null",
-      "duration": "30m",
-      "energy": "low" | "medium" | "high"
-    }
-  ],
-  "globalEnergyUpdate": "low" | "medium" | "high" | null,
-  "coachingMessage": "Jerald's premium coaching response text."
-}
+EXAMPLES:
+- "meeting at 2pm" -> title: "Meeting", time: "14:00"
+- "call mom tomorrow" -> title: "Call mom", dateOffset: 1
+- "I want to go for a run at 7am today" -> title: "Go for a run", time: "07:00", dateOffset: 0
+- "gym session at 6pm on friday" -> title: "Gym session", compute dateOffset from today to next Friday
 
-Rules:
-- "tasks" MUST ALWAYS be an array, even if there is only 1 task. Never return a bare object — always wrap in an array.
-- "tasks" must be an empty array [] if the user is not adding tasks.
-- Each tasks entry MUST include an explicit "date" string computed from the current system date. Never return "tomorrow" or a dateOffset — compute the actual YYYY-MM-DD.
-- Generate a unique id string for each task (e.g., "task_" + random alphanumeric).
-- "time" is HH:MM 24-hour format or null if unspecified.
-- "duration" is a string like "30m", "1h", "1.5h".
-- "energy" maps to task intensity: low = casual, medium = focus, high = high energy.
-- Strip ALL relative time markers ("tomorrow", "today", "at 7am", "on Monday", "at 2pm", "at 8:30am") from the title string.
-- The title must be grammatically complete after stripping. If stripping leaves a dangling modifier (e.g., "meeting at"), capitalize and keep the noun ("Meeting").
-- Respond with ONLY the JSON object.`;
+DATE CALCULATION:
+- Use the "Today's Date" from the SYSTEM RUNTIME CONTEXT to compute dateOffset.
+- "today" -> dateOffset: 0
+- "tomorrow" -> dateOffset: 1
+- "next Monday" -> count days from today to next Monday
+- If no date is mentioned, default to dateOffset: 0 (today).
+
+TIME FORMAT:
+- Convert all times to 24-hour HH:MM format.
+- "2pm" -> "14:00", "8:30am" -> "08:30", "noon" -> "12:00"
+
+Your response is STRICTLY controlled by a JSON schema. You MUST provide:
+- tasks: array of task objects (empty [] if no tasks)
+- globalEnergy: "low" | "medium" | "high" | null (if user mentions their overall energy)
+- coachingMessage: brief, friendly response to the user`;
 }
 
 /**
